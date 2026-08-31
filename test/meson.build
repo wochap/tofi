@@ -1,5 +1,6 @@
 tests = [
   'config',
+  'input',
   'utf8'
 ]
 

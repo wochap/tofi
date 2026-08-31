@@ -6,5 +6,6 @@
 
 void input_handle_keypress(struct tofi *tofi, xkb_keycode_t keycode);
 void input_refresh_results(struct tofi *tofi);
+bool input_delete_selection(struct entry *entry);
 
 #endif /* INPUT_H */

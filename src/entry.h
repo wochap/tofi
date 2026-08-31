@@ -80,6 +80,7 @@ struct entry {
 	uint32_t input_utf32_length;
 	uint32_t input_utf8_length;
 	uint32_t cursor_position;
+	uint32_t selection_anchor;
 
 	uint32_t selection;
 	uint32_t first_result;

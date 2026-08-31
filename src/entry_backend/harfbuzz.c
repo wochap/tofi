@@ -9,6 +9,38 @@
 #include "../unicode.h"
 #include "../xmalloc.h"
 
+static double shaped_position_x(
+		hb_buffer_t *buffer,
+		uint32_t text_length,
+		uint32_t position,
+		double scale)
+{
+	unsigned int glyph_count;
+	hb_glyph_info_t *glyph_info = hb_buffer_get_glyph_infos(buffer, &glyph_count);
+	hb_glyph_position_t *glyph_pos = hb_buffer_get_glyph_positions(buffer, &glyph_count);
+	int32_t x = 0;
+	for (size_t i = 0; i < glyph_count; i++) {
+		uint32_t cluster = glyph_info[i].cluster;
+		int32_t advance = glyph_pos[i].x_advance;
+		uint32_t next_cluster = text_length;
+		for (size_t j = i + 1; j < glyph_count; j++) {
+			if (glyph_info[j].cluster > cluster) {
+				next_cluster = glyph_info[j].cluster;
+				break;
+			}
+		}
+		if (next_cluster > position) {
+			uint32_t cluster_length = next_cluster - cluster;
+			if (cluster_length > 1) {
+				x += (position - cluster) * advance / cluster_length;
+			}
+			break;
+		}
+		x += advance;
+	}
+	return x / 64.0 / scale;
+}
+
 /*
  * FreeType is normally compiled without error strings, so we have to do this
  * funky macro trick to get them. See <freetype/fterrors.h> for more details.
@@ -268,6 +300,7 @@ static cairo_text_extents_t render_input(
 		uint32_t text_length,
 		const struct text_theme *theme,
 		uint32_t cursor_position,
+		uint32_t selection_anchor,
 		const struct cursor_theme *cursor_theme)
 {
 	cairo_font_extents_t font_extents;
@@ -329,6 +362,23 @@ static cairo_text_extents_t render_input(
 		render_hb_buffer(cr, &hb->hb_font_extents, hb->hb_buffer, hb->scale);
 	}
 
+	if (cursor_position != selection_anchor) {
+		uint32_t start = MIN(cursor_position, selection_anchor);
+		uint32_t end = MAX(cursor_position, selection_anchor);
+		double start_x = shaped_position_x(hb->hb_buffer, text_length, start, hb->scale);
+		double end_x = shaped_position_x(hb->hb_buffer, text_length, end, hb->scale);
+		cairo_save(cr);
+		color = cursor_theme->color;
+		cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a * 0.5);
+		cairo_rectangle(cr, start_x, 0, end_x - start_x, font_extents.height);
+		cairo_fill_preserve(cr);
+		cairo_clip(cr);
+		color = cursor_theme->text_color;
+		cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a);
+		render_hb_buffer(cr, &hb->hb_font_extents, hb->hb_buffer, hb->scale);
+		cairo_restore(cr);
+	}
+
 	if (!cursor_theme->show) {
 		/* No cursor to draw, we're done. */
 		return extents;
@@ -342,73 +392,17 @@ static cairo_text_extents_t render_input(
 		cursor_x = extents.x_advance;
 		cursor_width = cursor_theme->em_width;
 	} else {
-		/*
-		 * If the cursor is within the text, there's a bit more to do.
-		 *
-		 * We need to walk through the drawn glyphs, advancing the
-		 * cursor by the appropriate amount as we go. This is
-		 * complicated by the potential presence of ligatures, which
-		 * mean the cursor could be located part way through a single
-		 * glyph.
-		 *
-		 * To determine the appropriate width for the block and
-		 * underscore cursors, we then do the same thing again, this
-		 * time stopping at the character after the cursor. The width
-		 * is then the difference between these two positions.
-		 */
-		unsigned int glyph_count;
-		hb_glyph_info_t *glyph_info = hb_buffer_get_glyph_infos(hb->hb_buffer, &glyph_count);
-		hb_glyph_position_t *glyph_pos = hb_buffer_get_glyph_positions(hb->hb_buffer, &glyph_count);
-		int32_t cursor_start = 0;
-		int32_t cursor_end = 0;
-		for (size_t i = 0; i < glyph_count; i++) {
-			uint32_t cluster = glyph_info[i].cluster;
-			int32_t x_advance = glyph_pos[i].x_advance;
-			uint32_t next_cluster = text_length;
-			for (size_t j = i + 1; j < glyph_count; j++) {
-				/*
-				 * This needs to be a loop to account for
-				 * multiple glyphs sharing the same cluster
-				 * (e.g. diacritics).
-				 */
-				if (glyph_info[j].cluster > cluster) {
-					next_cluster = glyph_info[j].cluster;
-					break;
-				}
-			}
-			if (next_cluster > cursor_position) {
-				size_t glyph_clusters = next_cluster - cluster;
-				if (glyph_clusters > 1) {
-					uint32_t diff = cursor_position - cluster;
-					cursor_start += diff * x_advance / glyph_clusters;
-				}
-				break;
-			}
-			cursor_start += x_advance;
-		}
-		for (size_t i = 0; i < glyph_count; i++) {
-			uint32_t cluster = glyph_info[i].cluster;
-			int32_t x_advance = glyph_pos[i].x_advance;
-			uint32_t next_cluster = text_length;
-			for (size_t j = i + 1; j < glyph_count; j++) {
-				if (glyph_info[j].cluster > cluster) {
-					next_cluster = glyph_info[j].cluster;
-					break;
-				}
-			}
-			if (next_cluster > cursor_position + 1) {
-				size_t glyph_clusters = next_cluster - cluster;
-				if (glyph_clusters > 1) {
-					uint32_t diff = cursor_position + 1 - cluster;
-					cursor_end += diff * x_advance / glyph_clusters;
-				}
-				break;
-			}
-			cursor_end += x_advance;
-		}
-		/* Convert from HarfBuzz 26.6 fixed-point to float. */
-		cursor_x = cursor_start / 64.0 / hb->scale;
-		cursor_width = (cursor_end - cursor_start) / 64.0 / hb->scale;
+		cursor_x = shaped_position_x(
+				hb->hb_buffer,
+				text_length,
+				cursor_position,
+				hb->scale);
+		double cursor_end = shaped_position_x(
+				hb->hb_buffer,
+				text_length,
+				cursor_position + 1,
+				hb->scale);
+		cursor_width = cursor_end - cursor_x;
 	}
 
 	cairo_save(cr);
@@ -692,6 +686,7 @@ void entry_backend_harfbuzz_update(struct entry *entry)
 				utf32_strlen(tmp),
 				&entry->placeholder_theme,
 				0,
+				0,
 				&entry->cursor_theme);
 		free(tmp);
 	} else if (entry->hide_input) {
@@ -709,6 +704,7 @@ void entry_backend_harfbuzz_update(struct entry *entry)
 				entry->input_utf32_length,
 				&entry->input_theme,
 				entry->cursor_position,
+				entry->selection_anchor,
 				&entry->cursor_theme);
 		free(buf);
 	} else {
@@ -719,6 +715,7 @@ void entry_backend_harfbuzz_update(struct entry *entry)
 				entry->input_utf32_length,
 				&entry->input_theme,
 				entry->cursor_position,
+				entry->selection_anchor,
 				&entry->cursor_theme);
 	}
 	extents.x_advance = MAX(extents.x_advance, entry->input_width);

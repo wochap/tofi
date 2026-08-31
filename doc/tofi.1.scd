@@ -38,6 +38,37 @@ All config file options described in *tofi*(5) are also accepted, in the form
 
 # KEYS
 
+<Ctrl>-a
+	Select all input text.
+
+<Shift>-<Left> | <Shift>-<Right>
+	Extend or shrink the input text selection.
+
+<Ctrl>-<Left> | <Ctrl>-<Right>
+	Move the text cursor one word.
+
+<Ctrl>-<Shift>-<Left> | <Ctrl>-<Shift>-<Right>
+	Extend or shrink the input text selection by one word.
+
+<Ctrl>-c
+	Copy selected input text. If no input text is selected, quit without making
+	a selection.
+
+<Ctrl>-x
+	Cut selected input text.
+
+<Ctrl>-v
+	Paste clipboard text.
+
+<Ctrl>-<Insert> | <Shift>-<Insert> | <Shift>-<Delete>
+	Copy, paste, or cut selected input text, respectively.
+
+<Home> | <End>
+	Move the text cursor to the start or end of the input.
+
+<Shift>-<Home> | <Shift>-<End>
+	Extend the input text selection to the start or end of the input.
+
 <Up> | <Left> | <Ctrl>-k | <Ctrl>-p | <Ctrl>-b | <Alt>-k | <Alt>-p | <Alt>-h |
 <Shift>-<Tab>
 	Move the selection back one entry.
@@ -55,16 +86,22 @@ All config file options described in *tofi*(5) are also accepted, in the form
 <Backspace> | <Ctrl>-h
 	Delete character.
 
+<Delete>
+	Delete the next character.
+
 <Ctrl>-u
 	Delete line.
 
 <Ctrl>-w | <Ctrl>-<Backspace>
 	Delete word.
 
+<Ctrl>-<Delete>
+	Delete the next word.
+
 <Enter> | <Ctrl>-m
 	Confirm the current selection and quit.
 
-<Escape> | <Ctrl>-c | <Ctrl>-g | <Ctrl>-[
+<Escape> | <Ctrl>-g | <Ctrl>-[
 	Quit without making a selection.
 
 # FILES

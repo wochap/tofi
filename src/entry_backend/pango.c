@@ -41,6 +41,7 @@ static void render_text_themed(
 		PangoRectangle *logical_rect)
 {
 	PangoLayout *layout = entry->pango.layout;
+	pango_layout_set_attributes(layout, NULL);
 	struct color color = theme->foreground_color;
 	cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a);
 
@@ -101,6 +102,53 @@ static void render_text_themed(
 	pango_cairo_show_layout(cr, layout);
 }
 
+static const char *utf8_at(const char *text, uint32_t position)
+{
+	for (uint32_t i = 0; i < position; i++) {
+		text = utf8_next_char(text);
+	}
+	return text;
+}
+
+static void set_input_selection_attributes(
+		PangoLayout *layout,
+		const char *text,
+		uint32_t cursor_position,
+		uint32_t selection_anchor,
+		const struct cursor_theme *cursor_theme)
+{
+	pango_layout_set_attributes(layout, NULL);
+	if (cursor_position == selection_anchor) {
+		return;
+	}
+
+	uint32_t start = MIN(cursor_position, selection_anchor);
+	uint32_t end = MAX(cursor_position, selection_anchor);
+	uint32_t start_index = utf8_at(text, start) - text;
+	uint32_t end_index = utf8_at(text, end) - text;
+
+	PangoAttrList *attributes = pango_attr_list_new();
+	PangoAttribute *background = pango_attr_background_new(
+			cursor_theme->color.r * UINT16_MAX,
+			cursor_theme->color.g * UINT16_MAX,
+			cursor_theme->color.b * UINT16_MAX);
+	PangoAttribute *background_alpha = pango_attr_background_alpha_new(
+			cursor_theme->color.a * 0.5 * UINT16_MAX);
+	PangoAttribute *foreground = pango_attr_foreground_new(
+			cursor_theme->text_color.r * UINT16_MAX,
+			cursor_theme->text_color.g * UINT16_MAX,
+			cursor_theme->text_color.b * UINT16_MAX);
+	background->start_index = background_alpha->start_index
+		= foreground->start_index = start_index;
+	background->end_index = background_alpha->end_index
+		= foreground->end_index = end_index;
+	pango_attr_list_insert(attributes, background);
+	pango_attr_list_insert(attributes, background_alpha);
+	pango_attr_list_insert(attributes, foreground);
+	pango_layout_set_attributes(layout, attributes);
+	pango_attr_list_unref(attributes);
+}
+
 static void render_input(
 		cairo_t *cr,
 		PangoLayout *layout,
@@ -108,6 +156,7 @@ static void render_input(
 		uint32_t text_length,
 		const struct text_theme *theme,
 		uint32_t cursor_position,
+		uint32_t selection_anchor,
 		const struct cursor_theme *cursor_theme,
 		PangoRectangle *ink_rect,
 		PangoRectangle *logical_rect)
@@ -117,6 +166,12 @@ static void render_input(
 	cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a);
 
 	pango_layout_set_text(layout, text, -1);
+	set_input_selection_attributes(
+			layout,
+			text,
+			cursor_position,
+			selection_anchor,
+			cursor_theme);
 	pango_cairo_update_layout(cr, layout);
 	pango_cairo_show_layout(cr, layout);
 
@@ -179,10 +234,7 @@ static void render_input(
 		 * Pango wants a byte index rather than a character index for
 		 * the cursor position, so we have to calculate that here.
 		 */
-		const char *tmp = text;
-		for (size_t i = 0; i < cursor_position; i++) {
-			tmp = utf8_next_char(tmp);
-		}
+		const char *tmp = utf8_at(text, cursor_position);
 		uint32_t start_byte_index = tmp - text;
 		uint32_t end_byte_index = utf8_next_char(tmp) - text;
 		PangoRectangle start_pos;
@@ -337,6 +389,7 @@ void entry_backend_pango_update(struct entry *entry)
 				utf8_strlen(entry->placeholder_text),
 				&entry->placeholder_theme,
 				0,
+				0,
 				&entry->cursor_theme,
 				&ink_rect,
 				&logical_rect);
@@ -358,6 +411,7 @@ void entry_backend_pango_update(struct entry *entry)
 				entry->input_utf32_length,
 				&entry->input_theme,
 				entry->cursor_position,
+				entry->selection_anchor,
 				&entry->cursor_theme,
 				&ink_rect,
 				&logical_rect);
@@ -370,6 +424,7 @@ void entry_backend_pango_update(struct entry *entry)
 				entry->input_utf32_length,
 				&entry->input_theme,
 				entry->cursor_position,
+				entry->selection_anchor,
 				&entry->cursor_theme,
 				&ink_rect,
 				&logical_rect);
@@ -385,6 +440,8 @@ void entry_backend_pango_update(struct entry *entry)
 	} else {
 		num_results = MIN(entry->num_results, entry->results.count);
 	}
+	/* Input selection attributes belong only to the input layout. */
+	pango_layout_set_attributes(layout, NULL);
 	/* Render our results */
 	size_t i;
 	for (i = 0; i < num_results; i++) {

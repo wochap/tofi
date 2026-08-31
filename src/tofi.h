@@ -51,6 +51,7 @@ struct tofi {
 	struct xkb_state *xkb_state;
 	struct xkb_context *xkb_context;
 	struct xkb_keymap *xkb_keymap;
+	uint32_t keyboard_serial;
 
 	/* State */
 	bool submit;

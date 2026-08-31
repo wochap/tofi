@@ -11,17 +11,28 @@
 
 static uint32_t keysym_to_key(xkb_keysym_t sym);
 static void add_character(struct tofi *tofi, xkb_keycode_t keycode);
-static void delete_character(struct tofi *tofi);
-static void delete_word(struct tofi *tofi);
+static void delete_previous_character(struct tofi *tofi);
+static void delete_next_character(struct tofi *tofi);
+static void delete_previous_word(struct tofi *tofi);
+static void delete_next_word(struct tofi *tofi);
 static void clear_input(struct tofi *tofi);
 static void paste(struct tofi *tofi);
+static void copy_selection(struct tofi *tofi);
+static void cut_selection(struct tofi *tofi);
+static void move_cursor(struct tofi *tofi, bool forward, bool by_word, bool select);
+static void move_cursor_to_boundary(struct tofi *tofi, bool to_end, bool select);
+static bool has_text_selection(const struct entry *entry);
+static bool collapse_text_selection(struct entry *entry, bool forward);
+static void delete_text_range(struct entry *entry, uint32_t start, uint32_t end);
+static uint32_t previous_word_start(const struct entry *entry, uint32_t position);
+static uint32_t next_word_start(const struct entry *entry, uint32_t position);
 static void select_previous_result(struct tofi *tofi);
 static void select_next_result(struct tofi *tofi);
 static void select_previous_page(struct tofi *tofi);
 static void select_next_page(struct tofi *tofi);
 static void next_cursor_or_result(struct tofi *tofi);
 static void previous_cursor_or_result(struct tofi *tofi);
-static void reset_selection(struct tofi *tofi);
+static void reset_result_selection(struct tofi *tofi);
 
 void input_handle_keypress(struct tofi *tofi, xkb_keycode_t keycode)
 {
@@ -43,6 +54,7 @@ void input_handle_keypress(struct tofi *tofi, xkb_keycode_t keycode)
 			XKB_STATE_MODS_EFFECTIVE);
 
 	uint32_t ch = xkb_state_key_get_utf32(tofi->xkb_state, keycode);
+	struct entry *entry = &tofi->window.entry;
 
 	/*
 	 * Use physical key code for shortcuts by default, ignoring layout
@@ -60,19 +72,40 @@ void input_handle_keypress(struct tofi *tofi, xkb_keycode_t keycode)
 	 */
 	if (utf32_isprint(ch) && !ctrl && !alt) {
 		add_character(tofi, keycode);
+	} else if (key == KEY_A && ctrl) {
+		entry->selection_anchor = 0;
+		entry->cursor_position = entry->input_utf32_length;
+	} else if (((key == KEY_C && ctrl) || (key == KEY_INSERT && ctrl))
+			&& has_text_selection(entry)) {
+		copy_selection(tofi);
+	} else if (((key == KEY_X && ctrl) || (key == KEY_DELETE && shift))
+			&& has_text_selection(entry)) {
+		cut_selection(tofi);
 	} else if ((key == KEY_BACKSPACE || key == KEY_W) && ctrl) {
-		delete_word(tofi);
+		delete_previous_word(tofi);
+	} else if (key == KEY_DELETE && ctrl) {
+		delete_next_word(tofi);
 	} else if (key == KEY_BACKSPACE
 			|| (key == KEY_H && ctrl)) {
-		delete_character(tofi);
+		delete_previous_character(tofi);
+	} else if (key == KEY_DELETE && !shift) {
+		delete_next_character(tofi);
 	} else if (key == KEY_U && ctrl) {
 		clear_input(tofi);
-	} else if (key == KEY_V && ctrl) {
+	} else if ((key == KEY_V && ctrl) || (key == KEY_INSERT && shift)) {
 		paste(tofi);
+	} else if (key == KEY_HOME || key == KEY_END) {
+		move_cursor_to_boundary(tofi, key == KEY_END, shift);
+	} else if ((key == KEY_LEFT || key == KEY_RIGHT) && (ctrl || shift)) {
+		move_cursor(tofi, key == KEY_RIGHT, ctrl, shift);
 	} else if (key == KEY_LEFT) {
-		previous_cursor_or_result(tofi);
+		if (!collapse_text_selection(entry, false)) {
+			previous_cursor_or_result(tofi);
+		}
 	} else if (key == KEY_RIGHT) {
-		next_cursor_or_result(tofi);
+		if (!collapse_text_selection(entry, true)) {
+			next_cursor_or_result(tofi);
+		}
 	} else if (key == KEY_UP
 			|| key == KEY_LEFT
 			|| (key == KEY_TAB && shift)
@@ -85,8 +118,6 @@ void input_handle_keypress(struct tofi *tofi, xkb_keycode_t keycode)
 			|| (key == KEY_L && alt)
 			|| ((key == KEY_J || key == KEY_N || key == KEY_F) && (ctrl || alt))) {
 		select_next_result(tofi);
-	} else if (key == KEY_HOME) {
-		reset_selection(tofi);
 	} else if (key == KEY_PAGEUP) {
 		select_previous_page(tofi);
 	} else if (key == KEY_PAGEDOWN) {
@@ -102,7 +133,7 @@ void input_handle_keypress(struct tofi *tofi, xkb_keycode_t keycode)
 		return;
 	}
 
-	if (tofi->auto_accept_single && tofi->window.entry.results.count == 1) {
+	if (tofi->auto_accept_single && entry->results.count == 1) {
 		tofi->submit = true;
 	}
 
@@ -114,6 +145,12 @@ static uint32_t keysym_to_key(xkb_keysym_t sym)
 	switch (sym) {
 		case XKB_KEY_BackSpace:
 			return KEY_BACKSPACE;
+		case XKB_KEY_Delete:
+			return KEY_DELETE;
+		case XKB_KEY_Insert:
+			return KEY_INSERT;
+		case XKB_KEY_a:
+			return KEY_A;
 		case XKB_KEY_w:
 			return KEY_W;
 		case XKB_KEY_u:
@@ -146,6 +183,8 @@ static uint32_t keysym_to_key(xkb_keysym_t sym)
 			return KEY_N;
 		case XKB_KEY_Home:
 			return KEY_HOME;
+		case XKB_KEY_End:
+			return KEY_END;
 		case XKB_KEY_Page_Up:
 			return KEY_PAGEUP;
 		case XKB_KEY_Page_Down:
@@ -154,6 +193,10 @@ static uint32_t keysym_to_key(xkb_keysym_t sym)
 			return KEY_ESC;
 		case XKB_KEY_c:
 			return KEY_C;
+		case XKB_KEY_x:
+			return KEY_X;
+		case XKB_KEY_g:
+			return KEY_G;
 		case XKB_KEY_bracketleft:
 			return KEY_LEFTBRACE;
 		case XKB_KEY_Return:
@@ -166,29 +209,31 @@ static uint32_t keysym_to_key(xkb_keysym_t sym)
 	return (uint32_t)-1;
 }
 
-void reset_selection(struct tofi *tofi)
+static void reset_result_selection(struct tofi *tofi)
 {
 	struct entry *entry = &tofi->window.entry;
 	entry->selection = 0;
 	entry->first_result = 0;
 }
 
-void add_character(struct tofi *tofi, xkb_keycode_t keycode)
+static void add_character(struct tofi *tofi, xkb_keycode_t keycode)
 {
 	struct entry *entry = &tofi->window.entry;
 
-	if (entry->input_utf32_length >= N_ELEM(entry->input_utf32) - 1) {
+	if (entry->input_utf32_length >= N_ELEM(entry->input_utf32) - 1
+			&& !has_text_selection(entry)) {
 		/* No more room for input */
 		return;
 	}
 
+	bool replaced_selection = input_delete_selection(entry);
 	char buf[5]; /* 4 UTF-8 bytes plus null terminator. */
 	int len = xkb_state_key_get_utf8(
 			tofi->xkb_state,
 			keycode,
 			buf,
 			sizeof(buf));
-	if (entry->cursor_position == entry->input_utf32_length) {
+	if (entry->cursor_position == entry->input_utf32_length && !replaced_selection) {
 		entry->input_utf32[entry->input_utf32_length] = utf8_to_utf32(buf);
 		entry->input_utf32_length++;
 		entry->input_utf32[entry->input_utf32_length] = U'\0';
@@ -207,7 +252,7 @@ void add_character(struct tofi *tofi, xkb_keycode_t keycode)
 			string_ref_vec_destroy(&tmp);
 		}
 
-		reset_selection(tofi);
+		reset_result_selection(tofi);
 	} else {
 		for (size_t i = entry->input_utf32_length; i > entry->cursor_position; i--) {
 			entry->input_utf32[i] = entry->input_utf32[i - 1];
@@ -220,6 +265,7 @@ void add_character(struct tofi *tofi, xkb_keycode_t keycode)
 	}
 
 	entry->cursor_position++;
+	entry->selection_anchor = entry->cursor_position;
 }
 
 void input_refresh_results(struct tofi *tofi)
@@ -241,75 +287,89 @@ void input_refresh_results(struct tofi *tofi)
 		entry->results = string_ref_vec_filter(&entry->commands, entry->input_utf8, tofi->matching_algorithm);
 	}
 
-	reset_selection(tofi);
+	reset_result_selection(tofi);
 }
 
-void delete_character(struct tofi *tofi)
+static void delete_previous_character(struct tofi *tofi)
 {
 	struct entry *entry = &tofi->window.entry;
-
-	if (entry->input_utf32_length == 0) {
-		/* No input to delete. */
+	if (input_delete_selection(entry)) {
+		input_refresh_results(tofi);
 		return;
 	}
 
 	if (entry->cursor_position == 0) {
 		return;
-	} else if (entry->cursor_position == entry->input_utf32_length) {
-		entry->cursor_position--;
-		entry->input_utf32_length--;
-		entry->input_utf32[entry->input_utf32_length] = U'\0';
-	} else {
-		for (size_t i = entry->cursor_position - 1; i < entry->input_utf32_length - 1; i++) {
-			entry->input_utf32[i] = entry->input_utf32[i + 1];
-		}
-		entry->cursor_position--;
-		entry->input_utf32_length--;
-		entry->input_utf32[entry->input_utf32_length] = U'\0';
 	}
 
+	delete_text_range(entry, entry->cursor_position - 1, entry->cursor_position);
 	input_refresh_results(tofi);
 }
 
-void delete_word(struct tofi *tofi)
+static void delete_next_character(struct tofi *tofi)
 {
 	struct entry *entry = &tofi->window.entry;
+	if (input_delete_selection(entry)) {
+		input_refresh_results(tofi);
+		return;
+	}
+
+	if (entry->cursor_position == entry->input_utf32_length) {
+		return;
+	}
+
+	delete_text_range(entry, entry->cursor_position, entry->cursor_position + 1);
+	input_refresh_results(tofi);
+}
+
+static void delete_previous_word(struct tofi *tofi)
+{
+	struct entry *entry = &tofi->window.entry;
+	if (input_delete_selection(entry)) {
+		input_refresh_results(tofi);
+		return;
+	}
 
 	if (entry->cursor_position == 0) {
 		/* No input to delete. */
 		return;
 	}
 
-	uint32_t new_cursor_pos = entry->cursor_position;
-	while (new_cursor_pos > 0 && utf32_isspace(entry->input_utf32[new_cursor_pos - 1])) {
-		new_cursor_pos--;
-	}
-	while (new_cursor_pos > 0 && !utf32_isspace(entry->input_utf32[new_cursor_pos - 1])) {
-		new_cursor_pos--;
-	}
-	uint32_t new_length = entry->input_utf32_length - (entry->cursor_position - new_cursor_pos);
-	for (size_t i = 0; i < new_length; i++) {
-		entry->input_utf32[new_cursor_pos + i] = entry->input_utf32[entry->cursor_position + i];
-	}
-	entry->input_utf32_length = new_length;
-	entry->input_utf32[entry->input_utf32_length] = U'\0';
-
-	entry->cursor_position = new_cursor_pos;
+	uint32_t start = previous_word_start(entry, entry->cursor_position);
+	delete_text_range(entry, start, entry->cursor_position);
 	input_refresh_results(tofi);
 }
 
-void clear_input(struct tofi *tofi)
+static void delete_next_word(struct tofi *tofi)
+{
+	struct entry *entry = &tofi->window.entry;
+	if (input_delete_selection(entry)) {
+		input_refresh_results(tofi);
+		return;
+	}
+
+	uint32_t end = next_word_start(entry, entry->cursor_position);
+	if (end == entry->cursor_position) {
+		return;
+	}
+
+	delete_text_range(entry, entry->cursor_position, end);
+	input_refresh_results(tofi);
+}
+
+static void clear_input(struct tofi *tofi)
 {
 	struct entry *entry = &tofi->window.entry;
 
 	entry->cursor_position = 0;
+	entry->selection_anchor = 0;
 	entry->input_utf32_length = 0;
 	entry->input_utf32[0] = U'\0';
 
 	input_refresh_results(tofi);
 }
 
-void paste(struct tofi *tofi)
+static void paste(struct tofi *tofi)
 {
 	if (tofi->clipboard.wl_data_offer == NULL || tofi->clipboard.mime_type == NULL) {
 		return;
@@ -332,7 +392,128 @@ void paste(struct tofi *tofi)
 	tofi->clipboard.fd = fildes[0];
 }
 
-void select_previous_result(struct tofi *tofi)
+static bool has_text_selection(const struct entry *entry)
+{
+	return entry->cursor_position != entry->selection_anchor;
+}
+
+static bool collapse_text_selection(struct entry *entry, bool forward)
+{
+	if (!has_text_selection(entry)) {
+		return false;
+	}
+
+	entry->cursor_position = forward
+		? MAX(entry->cursor_position, entry->selection_anchor)
+		: MIN(entry->cursor_position, entry->selection_anchor);
+	entry->selection_anchor = entry->cursor_position;
+	return true;
+}
+
+static void delete_text_range(struct entry *entry, uint32_t start, uint32_t end)
+{
+	memmove(
+			&entry->input_utf32[start],
+			&entry->input_utf32[end],
+			(entry->input_utf32_length - end + 1) * sizeof(entry->input_utf32[0]));
+	entry->input_utf32_length -= end - start;
+	entry->cursor_position = start;
+	entry->selection_anchor = start;
+}
+
+bool input_delete_selection(struct entry *entry)
+{
+	if (!has_text_selection(entry)) {
+		return false;
+	}
+
+	uint32_t start = MIN(entry->cursor_position, entry->selection_anchor);
+	uint32_t end = MAX(entry->cursor_position, entry->selection_anchor);
+	delete_text_range(entry, start, end);
+	return true;
+}
+
+static uint32_t previous_word_start(const struct entry *entry, uint32_t position)
+{
+	while (position > 0 && utf32_isspace(entry->input_utf32[position - 1])) {
+		position--;
+	}
+	while (position > 0 && !utf32_isspace(entry->input_utf32[position - 1])) {
+		position--;
+	}
+	return position;
+}
+
+static uint32_t next_word_start(const struct entry *entry, uint32_t position)
+{
+	while (position < entry->input_utf32_length
+			&& !utf32_isspace(entry->input_utf32[position])) {
+		position++;
+	}
+	while (position < entry->input_utf32_length
+			&& utf32_isspace(entry->input_utf32[position])) {
+		position++;
+	}
+	return position;
+}
+
+static void move_cursor(struct tofi *tofi, bool forward, bool by_word, bool select)
+{
+	struct entry *entry = &tofi->window.entry;
+	if (!select && collapse_text_selection(entry, forward)) {
+		return;
+	}
+
+	if (by_word) {
+		entry->cursor_position = forward
+			? next_word_start(entry, entry->cursor_position)
+			: previous_word_start(entry, entry->cursor_position);
+	} else if (forward && entry->cursor_position < entry->input_utf32_length) {
+		entry->cursor_position++;
+	} else if (!forward && entry->cursor_position > 0) {
+		entry->cursor_position--;
+	}
+	if (!select) {
+		entry->selection_anchor = entry->cursor_position;
+	}
+}
+
+static void move_cursor_to_boundary(struct tofi *tofi, bool to_end, bool select)
+{
+	struct entry *entry = &tofi->window.entry;
+	entry->cursor_position = to_end ? entry->input_utf32_length : 0;
+	if (!select) {
+		entry->selection_anchor = entry->cursor_position;
+	}
+}
+
+static void copy_selection(struct tofi *tofi)
+{
+	struct entry *entry = &tofi->window.entry;
+	uint32_t start = MIN(entry->cursor_position, entry->selection_anchor);
+	uint32_t end = MAX(entry->cursor_position, entry->selection_anchor);
+	char text[4 * MAX_INPUT_LENGTH + 1];
+	size_t bytes = 0;
+	for (uint32_t i = start; i < end; i++) {
+		bytes += utf32_to_utf8(entry->input_utf32[i], &text[bytes]);
+	}
+	text[bytes] = '\0';
+	clipboard_copy(
+			&tofi->clipboard,
+			tofi->wl_data_device_manager,
+			tofi->wl_data_device,
+			tofi->keyboard_serial,
+			text);
+}
+
+static void cut_selection(struct tofi *tofi)
+{
+	copy_selection(tofi);
+	input_delete_selection(&tofi->window.entry);
+	input_refresh_results(tofi);
+}
+
+static void select_previous_result(struct tofi *tofi)
 {
 	struct entry *entry = &tofi->window.entry;
 
@@ -352,7 +533,7 @@ void select_previous_result(struct tofi *tofi)
 	}
 }
 
-void select_next_result(struct tofi *tofi)
+static void select_next_result(struct tofi *tofi)
 {
 	struct entry *entry = &tofi->window.entry;
 
@@ -371,7 +552,7 @@ void select_next_result(struct tofi *tofi)
 	}
 }
 
-void previous_cursor_or_result(struct tofi *tofi)
+static void previous_cursor_or_result(struct tofi *tofi)
 {
 	struct entry *entry = &tofi->window.entry;
 
@@ -379,24 +560,26 @@ void previous_cursor_or_result(struct tofi *tofi)
 			&& entry->selection == 0
 			&& entry->cursor_position > 0) {
 		entry->cursor_position--;
+		entry->selection_anchor = entry->cursor_position;
 	} else {
 		select_previous_result(tofi);
 	}
 }
 
-void next_cursor_or_result(struct tofi *tofi)
+static void next_cursor_or_result(struct tofi *tofi)
 {
 	struct entry *entry = &tofi->window.entry;
 
 	if (entry->cursor_theme.show
 			&& entry->cursor_position < entry->input_utf32_length) {
 		entry->cursor_position++;
+		entry->selection_anchor = entry->cursor_position;
 	} else {
 		select_next_result(tofi);
 	}
 }
 
-void select_previous_page(struct tofi *tofi)
+static void select_previous_page(struct tofi *tofi)
 {
 	struct entry *entry = &tofi->window.entry;
 
@@ -409,7 +592,7 @@ void select_previous_page(struct tofi *tofi)
 	entry->last_num_results_drawn = entry->num_results_drawn;
 }
 
-void select_next_page(struct tofi *tofi)
+static void select_next_page(struct tofi *tofi)
 {
 	struct entry *entry = &tofi->window.entry;
 

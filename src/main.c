@@ -197,6 +197,7 @@ static void wl_keyboard_key(
 		uint32_t state)
 {
 	struct tofi *tofi = data;
+	tofi->keyboard_serial = serial;
 
 	/*
 	 * If this wasn't a keypress (i.e. was a key release), just update key
@@ -1067,6 +1068,7 @@ static bool do_submit(struct tofi *tofi)
 static void read_clipboard(struct tofi *tofi)
 {
 	struct entry *entry = &tofi->window.entry;
+	input_delete_selection(entry);
 
 	/* Make a copy of any text after the cursor. */
 	uint32_t *end_text = NULL;
@@ -1082,7 +1084,9 @@ static void read_clipboard(struct tofi *tofi)
 	memset(buffer, 0, N_ELEM(buffer));
 	errno = 0;
 	bool eof = false;
-	while (entry->cursor_position < N_ELEM(entry->input_utf32)) {
+	bool waiting = false;
+	bool failed = false;
+	while (entry->cursor_position < N_ELEM(entry->input_utf32) - 1) {
 		for (size_t i = 0; i < 4; i++) {
 			/*
 			 * Read input 1 byte at a time. This is slow, but easy,
@@ -1094,23 +1098,13 @@ static void read_clipboard(struct tofi *tofi)
 				break;
 			} else if (res == -1) {
 				if (errno == EAGAIN) {
-					/*
-					 * There was no more data to be read,
-					 * but EOF hasn't been reached yet.
-					 *
-					 * This could mean more than a pipe's
-					 * capacity (64k) of data was sent, in
-					 * which case we'd potentially skip
-					 * a character, but we should hit the
-					 * input length limit long before that.
-					 */
-					input_refresh_results(tofi);
-					tofi->window.surface.redraw = true;
-					return;
+					/* Preserve the text after the cursor until more data arrives. */
+					waiting = true;
+					break;
 				}
 				log_error("Failed to read clipboard: %s\n", strerror(errno));
-				clipboard_finish_paste(&tofi->clipboard);
-				return;
+				failed = true;
+				break;
 			}
 			uint32_t unichar = utf8_to_utf32_validate(buffer);
 			if (unichar == (uint32_t)-2) {
@@ -1120,13 +1114,23 @@ static void read_clipboard(struct tofi *tofi)
 				log_error("Invalid UTF-8 character in clipboard: %s\n", buffer);
 				break;
 			} else {
+				/* Keep pasted content valid for a single-line text field. */
+				if (unichar == U'\r') {
+					break;
+				}
+				if (unichar == U'\n' || unichar == U'\t') {
+					unichar = U' ';
+				} else if (!utf32_isprint(unichar)) {
+					break;
+				}
 				entry->input_utf32[entry->cursor_position] = unichar;
 				entry->cursor_position++;
+				entry->selection_anchor = entry->cursor_position;
 				break;
 			}
 		}
 		memset(buffer, 0, N_ELEM(buffer));
-		if (eof) {
+		if (eof || waiting || failed) {
 			break;
 		}
 	}
@@ -1135,7 +1139,7 @@ static void read_clipboard(struct tofi *tofi)
 	/* If there was any text after the cursor, re-insert it now. */
 	if (end_text != NULL) {
 		for (size_t i = 0; i < end_text_length; i++) {
-			if (entry->input_utf32_length == N_ELEM(entry->input_utf32)) {
+			if (entry->input_utf32_length == N_ELEM(entry->input_utf32) - 1) {
 				break;
 			}
 			entry->input_utf32[entry->input_utf32_length] = end_text[i];
@@ -1143,9 +1147,12 @@ static void read_clipboard(struct tofi *tofi)
 		}
 		free(end_text);
 	}
-	entry->input_utf32[MIN(entry->input_utf32_length, N_ELEM(entry->input_utf32) - 1)] = U'\0';
+	entry->input_utf32[entry->input_utf32_length] = U'\0';
+	entry->selection_anchor = entry->cursor_position;
 
-	clipboard_finish_paste(&tofi->clipboard);
+	if (!waiting) {
+		clipboard_finish_paste(&tofi->clipboard);
+	}
 
 	input_refresh_results(tofi);
 	tofi->window.surface.redraw = true;
@@ -1874,9 +1881,7 @@ int main(int argc, char *argv[])
 		wl_pointer_release(tofi.wl_pointer);
 	}
 	wl_compositor_destroy(tofi.wl_compositor);
-	if (tofi.clipboard.wl_data_offer != NULL) {
-		wl_data_offer_destroy(tofi.clipboard.wl_data_offer);
-	}
+	clipboard_destroy(&tofi.clipboard);
 	wl_data_device_release(tofi.wl_data_device);
 	wl_data_device_manager_destroy(tofi.wl_data_device_manager);
 	wl_seat_release(tofi.wl_seat);
