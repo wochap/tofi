@@ -32,13 +32,45 @@ static void rounded_rectangle(cairo_t *cr, uint32_t width, uint32_t height, uint
 	cairo_close_path(cr);
 }
 
+static void clip_result_text(cairo_t *cr, struct entry *entry, double width)
+{
+	cairo_matrix_t mat;
+	cairo_get_matrix(cr, &mat);
+	cairo_rectangle(cr, 0, entry->clip_y - mat.y0, MAX(width, 0), entry->clip_height);
+	cairo_clip(cr);
+}
+
+static double ellipsis_width(PangoLayout *layout)
+{
+	PangoLayout *ellipsis = pango_layout_copy(layout);
+	pango_layout_set_text(ellipsis, "…", -1);
+	PangoRectangle logical_rect;
+	pango_layout_get_pixel_extents(ellipsis, NULL, &logical_rect);
+	double width = logical_rect.x + logical_rect.width;
+	g_object_unref(ellipsis);
+	return width;
+}
+
+static void render_ellipsis(cairo_t *cr, PangoLayout *layout, double available_width, double width)
+{
+	cairo_save(cr);
+	cairo_translate(cr, MAX(available_width - width, 0), 0);
+	pango_layout_set_text(layout, "…", -1);
+	pango_cairo_update_layout(cr, layout);
+	pango_cairo_show_layout(cr, layout);
+	cairo_restore(cr);
+}
+
 static void render_text_themed(
 		cairo_t *cr,
 		struct entry *entry,
 		const char *text,
 		const struct text_theme *theme,
 		PangoRectangle *ink_rect,
-		PangoRectangle *logical_rect)
+		PangoRectangle *logical_rect,
+		double full_width,
+		double inner_left,
+		double inner_right)
 {
 	PangoLayout *layout = entry->pango.layout;
 	pango_layout_set_attributes(layout, NULL);
@@ -47,12 +79,26 @@ static void render_text_themed(
 
 	pango_layout_set_text(layout, text, -1);
 	pango_cairo_update_layout(cr, layout);
-	pango_cairo_show_layout(cr, layout);
-
+	/* Preserve the existing two-pass background rendering unless the new
+	 * full-width geometry is active. */
+	if (full_width <= 0) {
+		pango_cairo_show_layout(cr, layout);
+	}
 	pango_layout_get_pixel_extents(layout, ink_rect, logical_rect);
-
+	double available_width = full_width - inner_left - inner_right;
+	bool ellipsized = full_width > 0 && logical_rect->x + logical_rect->width > available_width;
+	double end_marker_width = ellipsized ? ellipsis_width(layout) : 0;
+	double text_clip_width = available_width - end_marker_width;
 	if (theme->background_color.a == 0) {
-		/* No background to draw, we're done. */
+		if (full_width > 0) {
+			cairo_save(cr);
+			clip_result_text(cr, entry, ellipsized ? text_clip_width : available_width);
+			pango_cairo_show_layout(cr, layout);
+			cairo_restore(cr);
+			if (ellipsized) {
+				render_ellipsis(cr, layout, available_width, end_marker_width);
+			}
+		}
 		return;
 	}
 
@@ -84,22 +130,40 @@ static void render_text_themed(
 	cairo_save(cr);
 	color = theme->background_color;
 	cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a);
-	cairo_translate(
-			cr,
-			-padding_left + ink_rect->x,
-			-padding_top);
-	rounded_rectangle(
-			cr,
-			ceil(ink_rect->width + padding_left + padding_right),
-			ceil(logical_rect->height + padding_top + padding_bottom),
-			theme->background_corner_radius
-			);
+	if (full_width > 0) {
+		cairo_translate(cr, -inner_left, -padding_top);
+		rounded_rectangle(
+				cr,
+				ceil(full_width),
+				ceil(logical_rect->height + padding_top + padding_bottom),
+				theme->background_corner_radius);
+	} else {
+		cairo_translate(
+				cr,
+				-padding_left + ink_rect->x,
+				-padding_top);
+		rounded_rectangle(
+				cr,
+				ceil(ink_rect->width + padding_left + padding_right),
+				ceil(logical_rect->height + padding_top + padding_bottom),
+				theme->background_corner_radius);
+	}
 	cairo_fill(cr);
 	cairo_restore(cr);
 
 	color = theme->foreground_color;
 	cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a);
-	pango_cairo_show_layout(cr, layout);
+	if (full_width > 0) {
+		cairo_save(cr);
+		clip_result_text(cr, entry, ellipsized ? text_clip_width : available_width);
+		pango_cairo_show_layout(cr, layout);
+		cairo_restore(cr);
+		if (ellipsized) {
+			render_ellipsis(cr, layout, available_width, end_marker_width);
+		}
+	} else {
+		pango_cairo_show_layout(cr, layout);
+	}
 }
 
 static const char *utf8_at(const char *text, uint32_t position)
@@ -375,7 +439,8 @@ void entry_backend_pango_update(struct entry *entry)
 	/* Render the prompt */
 	PangoRectangle ink_rect;
 	PangoRectangle logical_rect;
-	render_text_themed(cr, entry, entry->prompt_text, &entry->prompt_theme, &ink_rect, &logical_rect);
+	render_text_themed(cr, entry, entry->prompt_text, &entry->prompt_theme,
+			&ink_rect, &logical_rect, 0, 0, 0);
 
 	cairo_translate(cr, logical_rect.width + logical_rect.x, 0);
 	cairo_translate(cr, entry->prompt_padding, 0);
@@ -442,6 +507,28 @@ void entry_backend_pango_update(struct entry *entry)
 	}
 	/* Input selection attributes belong only to the input layout. */
 	pango_layout_set_attributes(layout, NULL);
+	bool custom_row_geometry = !entry->horizontal
+		&& (entry->result_x_padding_specified || entry->result_full_width);
+	double row_width = 0;
+	double row_inner_left = 0;
+	double row_inner_right = 0;
+	if (custom_row_geometry) {
+		double row_padding = MIN(entry->result_x_padding, entry->clip_width / 2);
+		row_width = entry->clip_width - 2 * row_padding;
+		if (entry->result_full_width) {
+			row_inner_left = MAX(0, MAX(
+					entry->default_result_theme.padding.left,
+					MAX(entry->alternate_result_theme.padding.left,
+						entry->selection_theme.padding.left)));
+			row_inner_right = MAX(0, MAX(
+					entry->default_result_theme.padding.right,
+					MAX(entry->alternate_result_theme.padding.right,
+						entry->selection_theme.padding.right)));
+		}
+		cairo_matrix_t mat;
+		cairo_get_matrix(cr, &mat);
+		cairo_translate(cr, entry->clip_x + row_padding - mat.x0, 0);
+	}
 	/* Render our results */
 	size_t i;
 	for (i = 0; i < num_results; i++) {
@@ -451,7 +538,8 @@ void entry_backend_pango_update(struct entry *entry)
 			cairo_translate(cr, 0, logical_rect.height + entry->result_spacing);
 		}
 		if (entry->num_results == 0) {
-			if (size_overflows(entry, 0, 0)) {
+			uint32_t height = entry->horizontal ? 0 : logical_rect.height;
+			if (size_overflows(entry, 0, height)) {
 				break;
 			}
 		} else if (i >= entry->num_results) {
@@ -472,28 +560,41 @@ void entry_backend_pango_update(struct entry *entry)
 		} else {
 			str = "";
 		}
-		if (i != entry->selection || (entry->selection_highlight_color.a == 0)) {
-			const struct text_theme *theme;
-			if (i == entry->selection) {
-				theme = &entry->selection_theme;
-			} else if (index % 2) {
-				theme = &entry->alternate_result_theme;;
-			} else {
-				theme = &entry->default_result_theme;;
+		const struct text_theme *theme;
+		if (i == entry->selection) {
+			theme = &entry->selection_theme;
+		} else if (index % 2) {
+			theme = &entry->alternate_result_theme;
+		} else {
+			theme = &entry->default_result_theme;
+		}
+
+		double inner_left = 0;
+		double inner_right = 0;
+		if (custom_row_geometry) {
+			cairo_save(cr);
+			cairo_matrix_t mat;
+			cairo_get_matrix(cr, &mat);
+			cairo_rectangle(cr, 0, entry->clip_y - mat.y0, row_width, entry->clip_height);
+			cairo_clip(cr);
+			if (entry->result_full_width) {
+				inner_left = row_inner_left;
+				inner_right = row_inner_right;
+				cairo_translate(cr, inner_left, 0);
 			}
+		}
+
+		if (i != entry->selection || (entry->selection_highlight_color.a == 0)) {
 
 			if (entry->num_results > 0) {
-				render_text_themed(cr, entry, str, theme, &ink_rect, &logical_rect);
+				render_text_themed(cr, entry, str, theme, &ink_rect, &logical_rect,
+						entry->result_full_width ? row_width : 0, inner_left, inner_right);
 			} else if (!entry->horizontal) {
-				if (size_overflows(entry, 0, logical_rect.height)) {
-					entry->num_results_drawn = i;
-					break;
-				} else {
-					render_text_themed(cr, entry, str, theme, &ink_rect, &logical_rect);
-				}
+				render_text_themed(cr, entry, str, theme, &ink_rect, &logical_rect,
+						entry->result_full_width ? row_width : 0, inner_left, inner_right);
 			} else {
 				cairo_push_group(cr);
-				render_text_themed(cr, entry, str, theme, &ink_rect, &logical_rect);
+				render_text_themed(cr, entry, str, theme, &ink_rect, &logical_rect, 0, 0, 0);
 
 				cairo_pattern_t *group = cairo_pop_group(cr);
 				if (size_overflows(entry, logical_rect.width, 0)) {
@@ -525,8 +626,22 @@ void entry_backend_pango_update(struct entry *entry)
 				}
 			}
 
+			bool full_selection_background = entry->result_full_width
+				&& custom_row_geometry
+				&& entry->selection_theme.background_color.a != 0;
+			double selection_available_width = row_width - inner_left - inner_right;
+			bool selection_ellipsized = false;
+			double selection_ellipsis_width = 0;
 			for (int pass = 0; pass < 2; pass++) {
+				if (full_selection_background && pass == 0) {
+					cairo_push_group(cr);
+				}
 				cairo_save(cr);
+				if (full_selection_background && pass == 1) {
+					selection_ellipsized = logical_rect.width > selection_available_width;
+					selection_ellipsis_width = selection_ellipsized ? ellipsis_width(layout) : 0;
+					clip_result_text(cr, entry, selection_available_width - selection_ellipsis_width);
+				}
 				color = entry->selection_theme.foreground_color;
 				cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a);
 
@@ -574,6 +689,16 @@ void entry_backend_pango_update(struct entry *entry)
 				}
 
 				cairo_restore(cr);
+				if (full_selection_background && pass == 1 && selection_ellipsized) {
+					color = entry->selection_theme.foreground_color;
+					cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a);
+					render_ellipsis(
+							cr, layout, selection_available_width, selection_ellipsis_width);
+				}
+				if (full_selection_background && pass == 0) {
+					cairo_pattern_t *group = cairo_pop_group(cr);
+					cairo_pattern_destroy(group);
+				}
 
 				if (entry->selection_theme.background_color.a == 0) {
 					break;
@@ -582,20 +707,25 @@ void entry_backend_pango_update(struct entry *entry)
 					cairo_save(cr);
 					color = entry->selection_theme.background_color;
 					cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a);
-					cairo_translate(
-							cr,
-							floor(-padding.left + ink_rect.x),
-							-padding.top);
-					rounded_rectangle(
-							cr,
-							ceil(ink_rect.width + padding.left + padding.right),
-							ceil(logical_rect.height + padding.top + padding.bottom),
-							entry->selection_theme.background_corner_radius
-							);
+					if (entry->result_full_width && custom_row_geometry) {
+						cairo_translate(cr, -inner_left, -padding.top);
+						rounded_rectangle(cr, ceil(row_width),
+								ceil(logical_rect.height + padding.top + padding.bottom),
+								entry->selection_theme.background_corner_radius);
+					} else {
+						cairo_translate(cr, floor(-padding.left + ink_rect.x), -padding.top);
+						rounded_rectangle(cr,
+								ceil(ink_rect.width + padding.left + padding.right),
+								ceil(logical_rect.height + padding.top + padding.bottom),
+								entry->selection_theme.background_corner_radius);
+					}
 					cairo_fill(cr);
 					cairo_restore(cr);
 				}
 			}
+		}
+		if (custom_row_geometry) {
+			cairo_restore(cr);
 		}
 	}
 	entry->num_results_drawn = i;

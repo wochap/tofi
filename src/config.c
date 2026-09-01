@@ -541,6 +541,17 @@ bool parse_option(struct tofi *tofi, const char *filename, size_t lineno, const 
 		if (!err) {
 			tofi->window.entry.result_spacing = val;
 		}
+	} else if (strcasecmp(option, "result-x-padding") == 0) {
+		uint32_t val = parse_uint32(filename, lineno, value, &err);
+		if (!err) {
+			tofi->window.entry.result_x_padding = val;
+			tofi->window.entry.result_x_padding_specified = true;
+		}
+	} else if (strcasecmp(option, "result-full-width") == 0) {
+		bool val = parse_bool(filename, lineno, value, &err);
+		if (!err) {
+			tofi->window.entry.result_full_width = val;
+		}
 	} else if (strcasecmp(option, "border-width") == 0) {
 		uint32_t val = parse_uint32(filename, lineno, value, &err);
 		if (!err) {

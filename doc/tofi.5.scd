@@ -425,6 +425,24 @@ options.
 
 	Default: 0
 
+*result-x-padding*=_px_
+	Symmetric horizontal padding for results in vertical mode. Setting this
+	option positions results relative to the drawable area instead of the input
+	position, and clips them at the corresponding right edge.
+
+	Default: unset
+
+*result-full-width*=_true|false_
+	Expand result backgrounds to the available result row width in vertical
+	mode. The row respects *result-x-padding*, while result background padding
+	remains as the inner spacing around its text. The largest horizontal padding
+	from the default, alternate, and selection themes is shared by every row, so
+	text does not move when the selection changes. Negative horizontal background
+	padding is treated as zero in this mode. Result text that exceeds the
+	available width is clipped and ends with an ellipsis.
+
+	Default: false
+
 *min-input-width*=_px_
 	Minimum width of input in horizontal mode.
 

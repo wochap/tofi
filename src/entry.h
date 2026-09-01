@@ -106,6 +106,9 @@ struct entry {
 	uint32_t num_results_drawn;
 	uint32_t last_num_results_drawn;
 	int32_t result_spacing;
+	uint32_t result_x_padding;
+	bool result_x_padding_specified;
+	bool result_full_width;
 	uint32_t font_size;
 	char font_name[MAX_FONT_NAME_LENGTH];
 	char font_features[MAX_FONT_FEATURES_LENGTH];

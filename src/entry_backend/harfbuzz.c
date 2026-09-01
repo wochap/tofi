@@ -82,6 +82,14 @@ static void rounded_rectangle(cairo_t *cr, uint32_t width, uint32_t height, uint
 	cairo_close_path(cr);
 }
 
+static void clip_result_text(cairo_t *cr, struct entry *entry, double width)
+{
+	cairo_matrix_t mat;
+	cairo_get_matrix(cr, &mat);
+	cairo_rectangle(cr, 0, entry->clip_y - mat.y0, MAX(width, 0), entry->clip_height);
+	cairo_clip(cr);
+}
+
 static const char *get_ft_error_string(int err_code)
 {
 	for (size_t i = 0; i < N_ELEM(ft_errors); i++) {
@@ -188,7 +196,9 @@ static void render_text_background(
 		cairo_t *cr,
 		struct entry *entry,
 		cairo_text_extents_t extents,
-		const struct text_theme *theme)
+		const struct text_theme *theme,
+		double full_width,
+		double inner_left)
 {
 	struct directional padding = theme->padding;
 	cairo_font_extents_t font_extents = entry->harfbuzz.cairo_font_extents;
@@ -226,16 +236,24 @@ static void render_text_background(
 	cairo_save(cr);
 	struct color color = theme->background_color;
 	cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a);
-	cairo_translate(
-			cr,
-			-padding_left + extents.x_bearing,
-			-padding_top);
-	rounded_rectangle(
-			cr,
-			ceil(extents.width + padding_left + padding_right),
-			ceil(font_extents.height + padding_top + padding_bottom),
-			theme->background_corner_radius
-			);
+	if (full_width > 0) {
+		cairo_translate(cr, -inner_left, -padding_top);
+		rounded_rectangle(
+				cr,
+				ceil(full_width),
+				ceil(font_extents.height + padding_top + padding_bottom),
+				theme->background_corner_radius);
+	} else {
+		cairo_translate(
+				cr,
+				-padding_left + extents.x_bearing,
+				-padding_top);
+		rounded_rectangle(
+				cr,
+				ceil(extents.width + padding_left + padding_right),
+				ceil(font_extents.height + padding_top + padding_bottom),
+				theme->background_corner_radius);
+	}
 	cairo_fill(cr);
 	cairo_restore(cr);
 }
@@ -249,7 +267,10 @@ static cairo_text_extents_t render_text_themed(
 		cairo_t *cr,
 		struct entry *entry,
 		const char *text,
-		const struct text_theme *theme)
+		const struct text_theme *theme,
+		double full_width,
+		double inner_left,
+		double inner_right)
 {
 	struct entry_backend_harfbuzz *hb = &entry->harfbuzz;
 
@@ -265,18 +286,59 @@ static cairo_text_extents_t render_text_themed(
 	 */
 	struct color color = theme->foreground_color;
 	cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a);
+	if (full_width > 0) {
+		cairo_push_group(cr);
+	}
 	cairo_text_extents_t extents = render_text(cr, hb, text);
+	if (full_width > 0) {
+		cairo_pattern_t *group = cairo_pop_group(cr);
+		cairo_pattern_destroy(group);
+	}
+	double available_width = full_width - inner_left - inner_right;
+	bool ellipsized = full_width > 0 && extents.x_advance > available_width;
+	cairo_text_extents_t ellipsis_extents = {0};
+	if (ellipsized) {
+		cairo_push_group(cr);
+		ellipsis_extents = render_text(cr, hb, "…");
+		cairo_pattern_t *group = cairo_pop_group(cr);
+		cairo_pattern_destroy(group);
+	}
+	double text_clip_width = available_width - ellipsis_extents.x_advance;
 
 	if (theme->background_color.a == 0) {
-		/* No background to draw, we're done. */
+		if (full_width > 0) {
+			cairo_save(cr);
+			clip_result_text(cr, entry, ellipsized ? text_clip_width : available_width);
+			render_text(cr, hb, text);
+			cairo_restore(cr);
+			if (ellipsized) {
+				cairo_save(cr);
+				cairo_translate(cr, MAX(available_width - ellipsis_extents.x_advance, 0), 0);
+				render_text(cr, hb, "…");
+				cairo_restore(cr);
+			}
+		}
 		return extents;
 	}
 
-	render_text_background(cr, entry, extents, theme);
+	render_text_background(cr, entry, extents, theme, full_width, inner_left);
 
 	color = theme->foreground_color;
 	cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a);
-	render_text(cr, hb, text);
+	if (full_width > 0) {
+		cairo_save(cr);
+		clip_result_text(cr, entry, ellipsized ? text_clip_width : available_width);
+		render_text(cr, hb, text);
+		cairo_restore(cr);
+		if (ellipsized) {
+			cairo_save(cr);
+			cairo_translate(cr, MAX(available_width - ellipsis_extents.x_advance, 0), 0);
+			render_text(cr, hb, "…");
+			cairo_restore(cr);
+		}
+	} else {
+		render_text(cr, hb, text);
+	}
 	return extents;
 }
 
@@ -664,7 +726,7 @@ void entry_backend_harfbuzz_update(struct entry *entry)
 	cairo_save(cr);
 
 	/* Render the prompt */
-	extents = render_text_themed(cr, entry, entry->prompt_text, &entry->prompt_theme);
+	extents = render_text_themed(cr, entry, entry->prompt_text, &entry->prompt_theme, 0, 0, 0);
 	{
 		struct entry_backend_harfbuzz *hb = &entry->harfbuzz;
 		hb_buffer_clear_contents(hb->hb_buffer);
@@ -726,6 +788,28 @@ void entry_backend_harfbuzz_update(struct entry *entry)
 	} else {
 		num_results = MIN(entry->num_results, entry->results.count);
 	}
+	bool custom_row_geometry = !entry->horizontal
+		&& (entry->result_x_padding_specified || entry->result_full_width);
+	double row_width = 0;
+	double row_inner_left = 0;
+	double row_inner_right = 0;
+	if (custom_row_geometry) {
+		double row_padding = MIN(entry->result_x_padding, entry->clip_width / 2);
+		row_width = entry->clip_width - 2 * row_padding;
+		if (entry->result_full_width) {
+			row_inner_left = MAX(0, MAX(
+					entry->default_result_theme.padding.left,
+					MAX(entry->alternate_result_theme.padding.left,
+						entry->selection_theme.padding.left)));
+			row_inner_right = MAX(0, MAX(
+					entry->default_result_theme.padding.right,
+					MAX(entry->alternate_result_theme.padding.right,
+						entry->selection_theme.padding.right)));
+		}
+		cairo_matrix_t mat;
+		cairo_get_matrix(cr, &mat);
+		cairo_translate(cr, entry->clip_x + row_padding - mat.x0, 0);
+	}
 	/* Render our results */
 	size_t i;
 	for (i = 0; i < num_results; i++) {
@@ -735,7 +819,8 @@ void entry_backend_harfbuzz_update(struct entry *entry)
 			cairo_translate(cr, 0, entry->harfbuzz.line_spacing / 64.0 + entry->result_spacing);
 		}
 		if (entry->num_results == 0) {
-			if (size_overflows(entry, 0, 0)) {
+			uint32_t height = entry->horizontal ? 0 : entry->harfbuzz.line_spacing / 64.0;
+			if (size_overflows(entry, 0, height)) {
 				break;
 			}
 		} else if (i >= entry->num_results) {
@@ -753,36 +838,48 @@ void entry_backend_harfbuzz_update(struct entry *entry)
 		}
 
 		const char *result = entry->results.buf[index].string;
+		const struct text_theme *theme;
+		if (i == entry->selection) {
+			theme = &entry->selection_theme;
+		} else if (index % 2) {
+			theme = &entry->alternate_result_theme;
+		} else {
+			theme = &entry->default_result_theme;
+		}
+
+		double inner_left = 0;
+		double inner_right = 0;
+		if (custom_row_geometry) {
+			cairo_save(cr);
+			cairo_matrix_t mat;
+			cairo_get_matrix(cr, &mat);
+			cairo_rectangle(cr, 0, entry->clip_y - mat.y0, row_width, entry->clip_height);
+			cairo_clip(cr);
+			if (entry->result_full_width) {
+				inner_left = row_inner_left;
+				inner_right = row_inner_right;
+				cairo_translate(cr, inner_left, 0);
+			}
+		}
 		/*
 		 * If this isn't the selected result, or it is but we're not
 		 * doing any fancy match-highlighting, just print as normal.
 		 */
 		if (i != entry->selection || (entry->selection_highlight_color.a == 0)) {
-			const struct text_theme *theme;
-			if (i == entry->selection) {
-				theme = &entry->selection_theme;
-			} else if (index % 2) {
-				theme = &entry->alternate_result_theme;;
-			} else {
-				theme = &entry->default_result_theme;;
-			}
-
 			if (entry->num_results > 0) {
 				/*
 				 * We're not auto-detecting how many results we
 				 * can fit, so just render the text.
 				 */
-				extents = render_text_themed(cr, entry, result, theme);
+				extents = render_text_themed(cr, entry, result, theme,
+						entry->result_full_width ? row_width : 0, inner_left, inner_right);
 			} else if (!entry->horizontal) {
 				/*
 				 * The height of the text doesn't change, so
 				 * we don't need to re-measure it each time.
 				 */
-				if (size_overflows(entry, 0, entry->harfbuzz.line_spacing / 64.0)) {
-					break;
-				} else {
-					extents = render_text_themed(cr, entry, result, theme);
-				}
+				extents = render_text_themed(cr, entry, result, theme,
+						entry->result_full_width ? row_width : 0, inner_left, inner_right);
 			} else {
 				/*
 				 * The difficult case: we're auto-detecting how
@@ -793,7 +890,7 @@ void entry_backend_harfbuzz_update(struct entry *entry)
 				 * to the main canvas only if it will fit.
 				 */
 				cairo_push_group(cr);
-				extents = render_text_themed(cr, entry, result, theme);
+				extents = render_text_themed(cr, entry, result, theme, 0, 0, 0);
 
 				cairo_pattern_t *group = cairo_pop_group(cr);
 				if (size_overflows(entry, extents.x_advance, 0)) {
@@ -845,8 +942,28 @@ void entry_backend_harfbuzz_update(struct entry *entry)
 				}
 			}
 
+			bool full_selection_background = entry->result_full_width
+				&& custom_row_geometry
+				&& entry->selection_theme.background_color.a != 0;
+			double selection_available_width = row_width - inner_left - inner_right;
+			bool selection_ellipsized = false;
+			cairo_text_extents_t selection_ellipsis_extents = {0};
 			for (int pass = 0; pass < 2; pass++) {
+				if (full_selection_background && pass == 0) {
+					cairo_push_group(cr);
+				}
 				cairo_save(cr);
+				if (full_selection_background && pass == 1) {
+					selection_ellipsized = extents.x_advance > selection_available_width;
+					if (selection_ellipsized) {
+						cairo_push_group(cr);
+						selection_ellipsis_extents = render_text(cr, &entry->harfbuzz, "…");
+						cairo_pattern_t *group = cairo_pop_group(cr);
+						cairo_pattern_destroy(group);
+					}
+					clip_result_text(cr, entry,
+							selection_available_width - selection_ellipsis_extents.x_advance);
+				}
 				struct color color = entry->selection_theme.foreground_color;
 				cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a);
 
@@ -900,6 +1017,21 @@ void entry_backend_harfbuzz_update(struct entry *entry)
 				}
 
 				cairo_restore(cr);
+				if (full_selection_background && pass == 1 && selection_ellipsized) {
+					struct color ellipsis_color = entry->selection_theme.foreground_color;
+					cairo_set_source_rgba(cr, ellipsis_color.r, ellipsis_color.g,
+							ellipsis_color.b, ellipsis_color.a);
+					cairo_save(cr);
+					cairo_translate(cr,
+							MAX(selection_available_width - selection_ellipsis_extents.x_advance, 0),
+							0);
+					render_text(cr, &entry->harfbuzz, "…");
+					cairo_restore(cr);
+				}
+				if (full_selection_background && pass == 0) {
+					cairo_pattern_t *group = cairo_pop_group(cr);
+					cairo_pattern_destroy(group);
+				}
 
 				if (entry->selection_theme.background_color.a == 0) {
 					/* No background box, we're done. */
@@ -909,7 +1041,13 @@ void entry_backend_harfbuzz_update(struct entry *entry)
 					 * First pass, paint over the text with
 					 * our background box.
 					 */
-					render_text_background(cr, entry, extents, &entry->selection_theme);
+					render_text_background(
+							cr,
+							entry,
+							extents,
+							&entry->selection_theme,
+							entry->result_full_width ? row_width : 0,
+							inner_left);
 				}
 			}
 
@@ -920,6 +1058,9 @@ void entry_backend_harfbuzz_update(struct entry *entry)
 			if (postmatch != NULL) {
 				free(postmatch);
 			}
+		}
+		if (custom_row_geometry) {
+			cairo_restore(cr);
 		}
 	}
 	entry->num_results_drawn = i;

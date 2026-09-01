@@ -54,7 +54,10 @@ int main(int argc, char *argv[])
 	/* Bools */
 	is_valid("horizontal", "tRuE", "Boolean true");
 	is_valid("horizontal", "fAlSe", "Boolean false");
+	is_valid("result-full-width", "true", "Full-width results enabled");
+	is_valid("result-full-width", "false", "Full-width results disabled");
 	isnt_valid("horizontal", "truefalse", "Invalid boolean");
+	isnt_valid("result-full-width", "yes", "Invalid full-width boolean");
 
 	/* Password characters */
 	is_valid("hidden-character", "O", "Single Latin character");
@@ -96,7 +99,9 @@ int main(int argc, char *argv[])
 
 	/* Unsigned values */
 	is_valid("corner-radius", "0", "UINT32 0");
+	is_valid("result-x-padding", "7", "Result horizontal padding");
 	is_valid("corner-radius", "4294967295", "UINT32 Max");
+	isnt_valid("result-x-padding", "-1", "Negative result horizontal padding");
 	isnt_valid("corner-radius", "4294967296", "UINT32 Max + 1");
 	isnt_valid("corner-radius", "-1", "UINT32 -1");
 	isnt_valid("corner-radius", "6A", "UINT32 invalid character");
@@ -118,6 +123,14 @@ int main(int argc, char *argv[])
 	is_valid("prompt-background-padding", "0,1,-2,3", "Four directional values");
 	isnt_valid("prompt-background-padding", "0,1,-2,3,-4", "Five directional values");
 	isnt_valid("prompt-background-padding", "0,1,-2,3,-4,5", "Six directional values");
+
+	/* New result row options are stored on the entry. */
+	struct tofi tofi = {0};
+	tap_is(config_apply(&tofi, "result-x-padding", "7"), true, "Apply result horizontal padding");
+	tap_is(tofi.window.entry.result_x_padding, 7, "Store result horizontal padding");
+	tap_is(tofi.window.entry.result_x_padding_specified, true, "Mark result horizontal padding specified");
+	tap_is(config_apply(&tofi, "result-full-width", "true"), true, "Apply full-width results");
+	tap_is(tofi.window.entry.result_full_width, true, "Store full-width results");
 
 	tap_plan();
 

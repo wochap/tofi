@@ -157,6 +157,14 @@
 	# Spacing between results in pixels. Can be negative.
 	result-spacing = 0
 
+	# Symmetric horizontal padding for results in vertical mode. When unset,
+	# results start at the input position as before.
+	# result-x-padding = 0
+
+	# Expand result backgrounds to the available result row width. Results too
+	# long for the row are clipped and end with an ellipsis.
+	result-full-width = false
+
 	# List results horizontally.
 	horizontal = false
 

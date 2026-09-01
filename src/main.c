@@ -892,6 +892,8 @@ const struct option long_options[] = {
 	{"alternate-result-background-padding", required_argument, NULL, 0},
 	{"alternate-result-background-corner-radius", required_argument, NULL, 0},
 	{"result-spacing", required_argument, NULL, 0},
+	{"result-x-padding", required_argument, NULL, 0},
+	{"result-full-width", required_argument, NULL, 0},
 	{"min-input-width", required_argument, NULL, 0},
 	{"border-width", required_argument, NULL, 0},
 	{"border-color", required_argument, NULL, 0},
