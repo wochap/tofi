@@ -185,7 +185,15 @@ static void wl_keyboard_leave(
 		uint32_t serial,
 		struct wl_surface *surface)
 {
-	/* Deliberately left blank */
+	/*
+	 * Another client (e.g. another layer shell surface) took keyboard
+	 * focus, so close rather than stay open and unfocused.
+	 */
+	struct tofi *tofi = data;
+	if (surface != NULL && surface == tofi->window.surface.wl_surface) {
+		tofi->closed = true;
+		log_debug("Keyboard focus lost, closing.\n");
+	}
 }
 
 static void wl_keyboard_key(
